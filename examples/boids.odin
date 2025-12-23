@@ -142,20 +142,18 @@ spawn_boids :: proc(world: ^ecs.World, count: int, screen_w, screen_h: f32) {
 
 process_boids :: proc(world: ^ecs.World, grid: ^Spatial_Grid, cache: ^Boid_Cache, params: ^Boid_Params, mouse_pos: [2]f32, mouse_attract, mouse_repel: bool) {
     MAX_NEIGHBORS :: 7
+    boid_mask := POSITION | VELOCITY | BOID
 
     grid_clear(grid)
     clear(&cache.positions_snapshot)
 
-    for &arch in world.archetypes {
-        if arch.mask & (POSITION | VELOCITY | BOID) != (POSITION | VELOCITY | BOID) {
-            continue
-        }
-        positions := ecs.column(&arch, Position)
-        velocities := ecs.column(&arch, Velocity)
-        if positions == nil || velocities == nil {
-            continue
-        }
-        for i in 0..<len(arch.entities) {
+    matching := ecs.get_matching_archetypes(world, boid_mask)
+    for arch_idx in matching {
+        arch := &world.archetypes[arch_idx]
+        positions := ecs.column_unchecked(arch, Position, POSITION)
+        velocities := ecs.column_unchecked(arch, Velocity, VELOCITY)
+        count := len(arch.entities)
+        #no_bounds_check for i in 0..<count {
             append(&cache.positions_snapshot, positions[i])
             grid_insert(grid, positions[i], velocities[i])
         }
@@ -164,16 +162,12 @@ process_boids :: proc(world: ^ecs.World, grid: ^Spatial_Grid, cache: ^Boid_Cache
     clear(&cache.velocity_updates)
 
     boid_idx := 0
-    for &arch in world.archetypes {
-        if arch.mask & (POSITION | VELOCITY | BOID) != (POSITION | VELOCITY | BOID) {
-            continue
-        }
-        velocities := ecs.column(&arch, Velocity)
-        if velocities == nil {
-            continue
-        }
+    for arch_idx in matching {
+        arch := &world.archetypes[arch_idx]
+        velocities := ecs.column_unchecked(arch, Velocity, VELOCITY)
+        count := len(arch.entities)
 
-        for i in 0..<len(arch.entities) {
+        #no_bounds_check for i in 0..<count {
             pos := cache.positions_snapshot[boid_idx]
             vel := velocities[i]
 
@@ -245,13 +239,11 @@ process_boids :: proc(world: ^ecs.World, grid: ^Spatial_Grid, cache: ^Boid_Cache
     }
 
     update_idx := 0
-    for &arch in world.archetypes {
-        if arch.mask & (POSITION | VELOCITY | BOID) != (POSITION | VELOCITY | BOID) {
-            continue
-        }
-        velocities := ecs.column(&arch, Velocity)
-        if velocities == nil { continue }
-        for i in 0..<len(arch.entities) {
+    for arch_idx in matching {
+        arch := &world.archetypes[arch_idx]
+        velocities := ecs.column_unchecked(arch, Velocity, VELOCITY)
+        count := len(arch.entities)
+        #no_bounds_check for i in 0..<count {
             velocities[i] = cache.velocity_updates[update_idx]
             update_idx += 1
         }
@@ -259,14 +251,14 @@ process_boids :: proc(world: ^ecs.World, grid: ^Spatial_Grid, cache: ^Boid_Cache
 }
 
 update_positions :: proc(world: ^ecs.World, dt: f32) {
-    for &arch in world.archetypes {
-        if arch.mask & (POSITION | VELOCITY) != (POSITION | VELOCITY) {
-            continue
-        }
-        positions := ecs.column(&arch, Position)
-        velocities := ecs.column(&arch, Velocity)
-        if positions == nil || velocities == nil { continue }
-        for i in 0..<len(arch.entities) {
+    move_mask := POSITION | VELOCITY
+    matching := ecs.get_matching_archetypes(world, move_mask)
+    for arch_idx in matching {
+        arch := &world.archetypes[arch_idx]
+        positions := ecs.column_unchecked(arch, Position, POSITION)
+        velocities := ecs.column_unchecked(arch, Velocity, VELOCITY)
+        count := len(arch.entities)
+        #no_bounds_check for i in 0..<count {
             positions[i].x += velocities[i].x * dt
             positions[i].y += velocities[i].y * dt
         }
@@ -274,11 +266,12 @@ update_positions :: proc(world: ^ecs.World, dt: f32) {
 }
 
 wrap_positions :: proc(world: ^ecs.World, screen_w, screen_h: f32) {
-    for &arch in world.archetypes {
-        if arch.mask & POSITION == 0 { continue }
-        positions := ecs.column(&arch, Position)
-        if positions == nil { continue }
-        for i in 0..<len(arch.entities) {
+    matching := ecs.get_matching_archetypes(world, POSITION)
+    for arch_idx in matching {
+        arch := &world.archetypes[arch_idx]
+        positions := ecs.column_unchecked(arch, Position, POSITION)
+        count := len(arch.entities)
+        #no_bounds_check for i in 0..<count {
             if positions[i].x < 0 { positions[i].x += screen_w }
             if positions[i].x > screen_w { positions[i].x -= screen_w }
             if positions[i].y < 0 { positions[i].y += screen_h }
@@ -288,16 +281,16 @@ wrap_positions :: proc(world: ^ecs.World, screen_w, screen_h: f32) {
 }
 
 render_boids :: proc(world: ^ecs.World) {
-    for &arch in world.archetypes {
-        if arch.mask & (POSITION | VELOCITY | COLOR) != (POSITION | VELOCITY | COLOR) {
-            continue
-        }
-        positions := ecs.column(&arch, Position)
-        velocities := ecs.column(&arch, Velocity)
-        colors := ecs.column(&arch, Boid_Color)
-        if positions == nil || velocities == nil || colors == nil { continue }
+    render_mask := POSITION | VELOCITY | COLOR
+    matching := ecs.get_matching_archetypes(world, render_mask)
+    for arch_idx in matching {
+        arch := &world.archetypes[arch_idx]
+        positions := ecs.column_unchecked(arch, Position, POSITION)
+        velocities := ecs.column_unchecked(arch, Velocity, VELOCITY)
+        colors := ecs.column_unchecked(arch, Boid_Color, COLOR)
+        count := len(arch.entities)
 
-        for i in 0..<len(arch.entities) {
+        #no_bounds_check for i in 0..<count {
             pos := positions[i]
             vel := velocities[i]
             col := colors[i]
