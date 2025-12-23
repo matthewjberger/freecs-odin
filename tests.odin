@@ -431,3 +431,164 @@ test_table_edges_cache :: proc(t: ^testing.T) {
     testing.expect(t, vel1 != nil && vel1.x == 2, "e1 Velocity correct")
     testing.expect(t, vel2 != nil && vel2.x == 4, "e2 Velocity correct")
 }
+
+@(test)
+test_command_buffer_despawn :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    buffer := create_command_buffer(&world)
+    defer destroy_command_buffer(&buffer)
+
+    e1 := spawn(&world, Position{1, 1})
+    e2 := spawn(&world, Position{2, 2})
+    e3 := spawn(&world, Position{3, 3})
+
+    testing.expect(t, entity_count(&world) == 3, "Should have 3 entities")
+
+    queue_despawn(&buffer, e2)
+    testing.expect(t, entity_count(&world) == 3, "Should still have 3 entities before apply")
+
+    apply_commands(&buffer)
+    testing.expect(t, entity_count(&world) == 2, "Should have 2 entities after apply")
+    testing.expect(t, is_alive(&world, e1), "e1 should be alive")
+    testing.expect(t, !is_alive(&world, e2), "e2 should be dead")
+    testing.expect(t, is_alive(&world, e3), "e3 should be alive")
+}
+
+@(test)
+test_command_buffer_spawn :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    buffer := create_command_buffer(&world)
+    defer destroy_command_buffer(&buffer)
+
+    queue_spawn(&buffer, Position{10, 20}, Velocity{1, 2})
+    testing.expect(t, entity_count(&world) == 0, "Should have 0 entities before apply")
+
+    apply_commands(&buffer)
+    testing.expect(t, entity_count(&world) == 1, "Should have 1 entity after apply")
+}
+
+@(test)
+test_tags :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    tags := create_tags()
+    defer destroy_tags(&tags)
+
+    player_tag := register_tag(&tags, "player")
+    enemy_tag := register_tag(&tags, "enemy")
+
+    e1 := spawn(&world, Position{1, 1})
+    e2 := spawn(&world, Position{2, 2})
+    e3 := spawn(&world, Position{3, 3})
+
+    add_tag(&tags, player_tag, e1)
+    add_tag(&tags, enemy_tag, e2)
+    add_tag(&tags, enemy_tag, e3)
+
+    testing.expect(t, has_tag(&tags, player_tag, e1), "e1 should have player tag")
+    testing.expect(t, !has_tag(&tags, enemy_tag, e1), "e1 should not have enemy tag")
+    testing.expect(t, has_tag(&tags, enemy_tag, e2), "e2 should have enemy tag")
+    testing.expect(t, has_tag(&tags, enemy_tag, e3), "e3 should have enemy tag")
+
+    testing.expect(t, tag_count(&tags, player_tag) == 1, "1 player")
+    testing.expect(t, tag_count(&tags, enemy_tag) == 2, "2 enemies")
+
+    remove_tag(&tags, enemy_tag, e2)
+    testing.expect(t, !has_tag(&tags, enemy_tag, e2), "e2 should no longer have enemy tag")
+    testing.expect(t, tag_count(&tags, enemy_tag) == 1, "1 enemy after removal")
+}
+
+@(test)
+test_events :: proc(t: ^testing.T) {
+    Damage_Event :: struct {
+        target: Entity,
+        amount: f32,
+    }
+
+    queue := create_event_queue(Damage_Event)
+    defer destroy_event_queue(&queue)
+
+    e1 := Entity{id = 1, generation = 0}
+
+    send_event(&queue, Damage_Event{target = e1, amount = 10})
+    send_event(&queue, Damage_Event{target = e1, amount = 20})
+
+    testing.expect(t, event_count(&queue) == 0, "No events in previous buffer yet")
+
+    update_event_queue(&queue)
+
+    testing.expect(t, event_count(&queue) == 2, "2 events after update")
+
+    events := read_events(&queue)
+    testing.expect(t, len(events) == 2, "Should read 2 events")
+    testing.expect(t, events[0].amount == 10, "First event amount should be 10")
+    testing.expect(t, events[1].amount == 20, "Second event amount should be 20")
+
+    update_event_queue(&queue)
+    testing.expect(t, event_count(&queue) == 0, "Events cleared after another update")
+}
+
+Game_World :: struct {
+    world: World,
+    delta_time: f32,
+    counter: int,
+}
+
+test_system_1 :: proc(game: ^Game_World) {
+    game.counter += 1
+}
+
+test_system_2 :: proc(game: ^Game_World) {
+    game.counter += 10
+}
+
+@(test)
+test_schedule :: proc(t: ^testing.T) {
+    game := Game_World{
+        world = setup_world(),
+        delta_time = 0.016,
+        counter = 0,
+    }
+    defer destroy_world(&game.world)
+
+    schedule := create_schedule(Game_World)
+    defer destroy_schedule(&schedule)
+
+    add_system_mut(&schedule, test_system_1)
+    add_system_mut(&schedule, test_system_2)
+
+    testing.expect(t, game.counter == 0, "Counter should start at 0")
+
+    run_schedule(&schedule, &game)
+    testing.expect(t, game.counter == 11, "Counter should be 11 after one run")
+
+    run_schedule(&schedule, &game)
+    testing.expect(t, game.counter == 22, "Counter should be 22 after two runs")
+}
+
+@(test)
+test_query_builder :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    spawn(&world, Position{1, 1})
+    spawn(&world, Position{2, 2}, Velocity{1, 0})
+    spawn(&world, Position{3, 3}, Velocity{0, 1}, Health{100})
+
+    count := query_builder_count(with(query(&world), POSITION))
+    testing.expect(t, count == 3, "3 entities have Position")
+
+    count = query_builder_count(without(with(query(&world), POSITION), VELOCITY))
+    testing.expect(t, count == 1, "1 entity has Position without Velocity")
+
+    count = query_builder_count(with(with(query(&world), POSITION), VELOCITY))
+    testing.expect(t, count == 2, "2 entities have Position+Velocity")
+
+    entity, found := query_builder_first(with(query(&world), HEALTH))
+    testing.expect(t, found, "Should find entity with Health")
+}

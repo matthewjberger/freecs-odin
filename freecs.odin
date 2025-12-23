@@ -866,3 +866,495 @@ column_unchecked :: #force_inline proc(arch: ^Archetype, $T: typeid, bit: u64) -
     count := len(arch.entities)
     return slice.reinterpret([]T, col.data[:count * size_of(T)])
 }
+
+Command_Type :: enum {
+    Spawn,
+    Despawn,
+    Add_Components,
+    Remove_Components,
+}
+
+Command :: struct {
+    command_type:  Command_Type,
+    entity:        Entity,
+    mask:          u64,
+    component_data: [dynamic]byte,
+    component_sizes: [dynamic]int,
+    component_bits: [dynamic]u64,
+}
+
+Command_Buffer :: struct {
+    commands: [dynamic]Command,
+    world:    ^World,
+}
+
+create_command_buffer :: proc(world: ^World) -> Command_Buffer {
+    return Command_Buffer{
+        commands = make([dynamic]Command),
+        world    = world,
+    }
+}
+
+destroy_command_buffer :: proc(buffer: ^Command_Buffer) {
+    for &cmd in buffer.commands {
+        delete(cmd.component_data)
+        delete(cmd.component_sizes)
+        delete(cmd.component_bits)
+    }
+    delete(buffer.commands)
+}
+
+clear_command_buffer :: proc(buffer: ^Command_Buffer) {
+    for &cmd in buffer.commands {
+        delete(cmd.component_data)
+        delete(cmd.component_sizes)
+        delete(cmd.component_bits)
+    }
+    clear(&buffer.commands)
+}
+
+queue_spawn :: proc(buffer: ^Command_Buffer, components: ..any) {
+    cmd := Command{
+        command_type    = .Spawn,
+        component_data  = make([dynamic]byte),
+        component_sizes = make([dynamic]int),
+        component_bits  = make([dynamic]u64),
+    }
+
+    for comp in components {
+        if bit, ok := buffer.world.type_bits[comp.id]; ok {
+            size := buffer.world.type_sizes[bit_index(bit)]
+            append(&cmd.component_bits, bit)
+            append(&cmd.component_sizes, size)
+            old_len := len(cmd.component_data)
+            resize(&cmd.component_data, old_len + size)
+            if comp.data != nil && size > 0 {
+                mem.copy(&cmd.component_data[old_len], comp.data, size)
+            }
+        }
+    }
+
+    append(&buffer.commands, cmd)
+}
+
+queue_despawn :: proc(buffer: ^Command_Buffer, entity: Entity) {
+    cmd := Command{
+        command_type    = .Despawn,
+        entity          = entity,
+        component_data  = make([dynamic]byte),
+        component_sizes = make([dynamic]int),
+        component_bits  = make([dynamic]u64),
+    }
+    append(&buffer.commands, cmd)
+}
+
+queue_add_components :: proc(buffer: ^Command_Buffer, entity: Entity, mask: u64) {
+    cmd := Command{
+        command_type    = .Add_Components,
+        entity          = entity,
+        mask            = mask,
+        component_data  = make([dynamic]byte),
+        component_sizes = make([dynamic]int),
+        component_bits  = make([dynamic]u64),
+    }
+    append(&buffer.commands, cmd)
+}
+
+queue_remove_components :: proc(buffer: ^Command_Buffer, entity: Entity, mask: u64) {
+    cmd := Command{
+        command_type    = .Remove_Components,
+        entity          = entity,
+        mask            = mask,
+        component_data  = make([dynamic]byte),
+        component_sizes = make([dynamic]int),
+        component_bits  = make([dynamic]u64),
+    }
+    append(&buffer.commands, cmd)
+}
+
+apply_commands :: proc(buffer: ^Command_Buffer) {
+    for &cmd in buffer.commands {
+        switch cmd.command_type {
+        case .Spawn:
+            mask: u64 = 0
+            for bit in cmd.component_bits {
+                mask |= bit
+            }
+            if mask != 0 {
+                type_info := make([dynamic]Type_Info_Entry, context.temp_allocator)
+                data_offset := 0
+                for index in 0 ..< len(cmd.component_bits) {
+                    bit := cmd.component_bits[index]
+                    size := cmd.component_sizes[index]
+                    append(
+                        &type_info,
+                        Type_Info_Entry{
+                            bit  = bit,
+                            size = size,
+                            data = &cmd.component_data[data_offset] if size > 0 else nil,
+                            tid  = nil,
+                        },
+                    )
+                    data_offset += size
+                }
+
+                arch_idx := find_or_create_archetype(buffer.world, mask, type_info[:])
+                arch := &buffer.world.archetypes[arch_idx]
+
+                entity := alloc_entity(buffer.world)
+                row := len(arch.entities)
+                append(&arch.entities, entity)
+
+                data_offset = 0
+                for index in 0 ..< len(cmd.component_bits) {
+                    bit := cmd.component_bits[index]
+                    size := cmd.component_sizes[index]
+                    col_idx := arch.column_bits[bit_index(bit)]
+                    if col_idx >= 0 {
+                        col := &arch.columns[col_idx]
+                        old_len := len(col.data)
+                        resize(&col.data, old_len + size)
+                        if size > 0 {
+                            mem.copy(&col.data[old_len], &cmd.component_data[data_offset], size)
+                        }
+                    }
+                    data_offset += size
+                }
+
+                buffer.world.locations[entity.id] = Entity_Location{
+                    generation      = entity.generation,
+                    archetype_index = u32(arch_idx),
+                    row             = u32(row),
+                    alive           = true,
+                }
+            }
+
+        case .Despawn:
+            despawn(buffer.world, cmd.entity)
+
+        case .Add_Components:
+            for bit_idx in 0 ..< MAX_COMPONENTS {
+                comp_bit := u64(1) << u64(bit_idx)
+                if cmd.mask & comp_bit != 0 {
+                    loc := buffer.world.locations[cmd.entity.id]
+                    if !loc.alive || loc.generation != cmd.entity.generation {
+                        continue
+                    }
+
+                    arch := &buffer.world.archetypes[loc.archetype_index]
+                    if arch.mask & comp_bit != 0 {
+                        continue
+                    }
+
+                    new_mask := arch.mask | comp_bit
+                    target_arch_idx := arch.edges.add_edges[bit_idx]
+
+                    if target_arch_idx < 0 {
+                        type_info := make([dynamic]Type_Info_Entry, context.temp_allocator)
+                        for &col in arch.columns {
+                            append(
+                                &type_info,
+                                Type_Info_Entry{bit = col.bit, size = col.elem_size, data = nil, tid = col.tid},
+                            )
+                        }
+                        size := buffer.world.type_sizes[bit_idx]
+                        append(&type_info, Type_Info_Entry{bit = comp_bit, size = size, data = nil, tid = nil})
+                        target_arch_idx = find_or_create_archetype(buffer.world, new_mask, type_info[:])
+                        buffer.world.archetypes[loc.archetype_index].edges.add_edges[bit_idx] = target_arch_idx
+                    }
+
+                    move_entity(buffer.world, cmd.entity, int(loc.archetype_index), int(loc.row), target_arch_idx)
+                }
+            }
+
+        case .Remove_Components:
+            for bit_idx in 0 ..< MAX_COMPONENTS {
+                comp_bit := u64(1) << u64(bit_idx)
+                if cmd.mask & comp_bit != 0 {
+                    loc := buffer.world.locations[cmd.entity.id]
+                    if !loc.alive || loc.generation != cmd.entity.generation {
+                        continue
+                    }
+
+                    arch := &buffer.world.archetypes[loc.archetype_index]
+                    if arch.mask & comp_bit == 0 {
+                        continue
+                    }
+
+                    new_mask := arch.mask & ~comp_bit
+
+                    if new_mask == 0 {
+                        despawn(buffer.world, cmd.entity)
+                        continue
+                    }
+
+                    target_arch_idx := arch.edges.remove_edges[bit_idx]
+
+                    if target_arch_idx < 0 {
+                        type_info := make([dynamic]Type_Info_Entry, context.temp_allocator)
+                        for &col in arch.columns {
+                            if col.bit != comp_bit {
+                                append(
+                                    &type_info,
+                                    Type_Info_Entry{bit = col.bit, size = col.elem_size, data = nil, tid = col.tid},
+                                )
+                            }
+                        }
+                        target_arch_idx = find_or_create_archetype(buffer.world, new_mask, type_info[:])
+                        buffer.world.archetypes[loc.archetype_index].edges.remove_edges[bit_idx] = target_arch_idx
+                    }
+
+                    move_entity(buffer.world, cmd.entity, int(loc.archetype_index), int(loc.row), target_arch_idx)
+                }
+            }
+        }
+    }
+
+    clear_command_buffer(buffer)
+}
+
+MAX_TAGS :: 64
+
+Tag_Storage :: struct {
+    entities: map[u32]Entity,
+}
+
+Tags :: struct {
+    storage:  [MAX_TAGS]Tag_Storage,
+    next_tag: int,
+    tag_names: map[string]int,
+}
+
+create_tags :: proc() -> Tags {
+    tags: Tags
+    tags.tag_names = make(map[string]int)
+    for index in 0 ..< MAX_TAGS {
+        tags.storage[index].entities = make(map[u32]Entity)
+    }
+    return tags
+}
+
+destroy_tags :: proc(tags: ^Tags) {
+    for index in 0 ..< MAX_TAGS {
+        delete(tags.storage[index].entities)
+    }
+    delete(tags.tag_names)
+}
+
+register_tag :: proc(tags: ^Tags, name: string) -> int {
+    if existing, ok := tags.tag_names[name]; ok {
+        return existing
+    }
+    tag_id := tags.next_tag
+    tags.next_tag += 1
+    tags.tag_names[name] = tag_id
+    return tag_id
+}
+
+add_tag :: proc(tags: ^Tags, tag_id: int, entity: Entity) {
+    if tag_id >= 0 && tag_id < MAX_TAGS {
+        tags.storage[tag_id].entities[entity.id] = entity
+    }
+}
+
+remove_tag :: proc(tags: ^Tags, tag_id: int, entity: Entity) {
+    if tag_id >= 0 && tag_id < MAX_TAGS {
+        delete_key(&tags.storage[tag_id].entities, entity.id)
+    }
+}
+
+has_tag :: proc(tags: ^Tags, tag_id: int, entity: Entity) -> bool {
+    if tag_id < 0 || tag_id >= MAX_TAGS {
+        return false
+    }
+    if stored, ok := tags.storage[tag_id].entities[entity.id]; ok {
+        return stored.generation == entity.generation
+    }
+    return false
+}
+
+query_tag :: proc(tags: ^Tags, tag_id: int, allocator := context.temp_allocator) -> []Entity {
+    if tag_id < 0 || tag_id >= MAX_TAGS {
+        return nil
+    }
+    entities := make([dynamic]Entity, allocator)
+    for _, entity in tags.storage[tag_id].entities {
+        append(&entities, entity)
+    }
+    return entities[:]
+}
+
+tag_count :: proc(tags: ^Tags, tag_id: int) -> int {
+    if tag_id < 0 || tag_id >= MAX_TAGS {
+        return 0
+    }
+    return len(tags.storage[tag_id].entities)
+}
+
+clear_entity_tags :: proc(tags: ^Tags, entity: Entity) {
+    for index in 0 ..< MAX_TAGS {
+        delete_key(&tags.storage[index].entities, entity.id)
+    }
+}
+
+Event_Queue :: struct($T: typeid) {
+    current:  [dynamic]T,
+    previous: [dynamic]T,
+}
+
+create_event_queue :: proc($T: typeid) -> Event_Queue(T) {
+    return Event_Queue(T){
+        current  = make([dynamic]T),
+        previous = make([dynamic]T),
+    }
+}
+
+destroy_event_queue :: proc(queue: ^Event_Queue($T)) {
+    delete(queue.current)
+    delete(queue.previous)
+}
+
+send_event :: proc(queue: ^Event_Queue($T), event: T) {
+    append(&queue.current, event)
+}
+
+read_events :: proc(queue: ^Event_Queue($T)) -> []T {
+    return queue.previous[:]
+}
+
+collect_events :: proc(queue: ^Event_Queue($T), allocator := context.temp_allocator) -> []T {
+    result := make([]T, len(queue.previous), allocator)
+    copy(result, queue.previous[:])
+    return result
+}
+
+drain_events :: proc(queue: ^Event_Queue($T)) -> []T {
+    result := queue.previous[:]
+    queue.previous = make([dynamic]T)
+    return result
+}
+
+update_event_queue :: proc(queue: ^Event_Queue($T)) {
+    clear(&queue.previous)
+    queue.previous, queue.current = queue.current, queue.previous
+}
+
+clear_event_queue :: proc(queue: ^Event_Queue($T)) {
+    clear(&queue.current)
+    clear(&queue.previous)
+}
+
+event_count :: proc(queue: ^Event_Queue($T)) -> int {
+    return len(queue.previous)
+}
+
+peek_events :: proc(queue: ^Event_Queue($T)) -> []T {
+    return queue.current[:]
+}
+
+System :: struct($World_Type: typeid) {
+    run:      proc(world: ^World_Type),
+    run_mut:  proc(world: ^World_Type),
+    is_mut:   bool,
+}
+
+Schedule :: struct($World_Type: typeid) {
+    systems: [dynamic]System(World_Type),
+}
+
+create_schedule :: proc($World_Type: typeid) -> Schedule(World_Type) {
+    return Schedule(World_Type){
+        systems = make([dynamic]System(World_Type)),
+    }
+}
+
+destroy_schedule :: proc(schedule: ^Schedule($World_Type)) {
+    delete(schedule.systems)
+}
+
+add_system :: proc(schedule: ^Schedule($World_Type), system_proc: proc(world: ^World_Type)) {
+    append(&schedule.systems, System(World_Type){
+        run    = system_proc,
+        is_mut = false,
+    })
+}
+
+add_system_mut :: proc(schedule: ^Schedule($World_Type), system_proc: proc(world: ^World_Type)) {
+    append(&schedule.systems, System(World_Type){
+        run_mut = system_proc,
+        is_mut  = true,
+    })
+}
+
+run_schedule :: proc(schedule: ^Schedule($World_Type), world: ^World_Type) {
+    for &system in schedule.systems {
+        if system.is_mut {
+            if system.run_mut != nil {
+                system.run_mut(world)
+            }
+        } else {
+            if system.run != nil {
+                system.run(world)
+            }
+        }
+    }
+}
+
+Query_Builder :: struct {
+    world:   ^World,
+    include: u64,
+    exclude: u64,
+}
+
+query :: proc(world: ^World) -> Query_Builder {
+    return Query_Builder{
+        world   = world,
+        include = 0,
+        exclude = 0,
+    }
+}
+
+with :: proc(builder: Query_Builder, mask: u64) -> Query_Builder {
+    return Query_Builder{
+        world   = builder.world,
+        include = builder.include | mask,
+        exclude = builder.exclude,
+    }
+}
+
+without :: proc(builder: Query_Builder, mask: u64) -> Query_Builder {
+    return Query_Builder{
+        world   = builder.world,
+        include = builder.include,
+        exclude = builder.exclude | mask,
+    }
+}
+
+iter :: proc(builder: Query_Builder, callback: proc(entity: Entity, arch: ^Archetype, index: int)) {
+    matching := get_matching_archetypes(builder.world, builder.include, builder.exclude)
+    for arch_idx in matching {
+        arch := &builder.world.archetypes[arch_idx]
+        for index in 0 ..< len(arch.entities) {
+            callback(arch.entities[index], arch, index)
+        }
+    }
+}
+
+iter_tables :: proc(builder: Query_Builder, callback: proc(arch: ^Archetype)) {
+    matching := get_matching_archetypes(builder.world, builder.include, builder.exclude)
+    for arch_idx in matching {
+        callback(&builder.world.archetypes[arch_idx])
+    }
+}
+
+query_builder_entities :: proc(builder: Query_Builder, allocator := context.temp_allocator) -> []Entity {
+    return query_entities(builder.world, builder.include, builder.exclude, allocator)
+}
+
+query_builder_count :: proc(builder: Query_Builder) -> int {
+    return query_count(builder.world, builder.include, builder.exclude)
+}
+
+query_builder_first :: proc(builder: Query_Builder) -> (Entity, bool) {
+    return query_first(builder.world, builder.include, builder.exclude)
+}
