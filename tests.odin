@@ -286,3 +286,148 @@ test_has_component :: proc(t: ^testing.T) {
     testing.expect(t, !has(&world, entity, Velocity), "Should not have Velocity")
     testing.expect(t, !has(&world, entity, Health), "Should not have Health")
 }
+
+@(test)
+test_add_component :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    entity := spawn(&world, Position{1, 2})
+
+    testing.expect(t, !has(&world, entity, Velocity), "Should not have Velocity initially")
+
+    add_component(&world, entity, Velocity{5, 6})
+
+    testing.expect(t, has(&world, entity, Velocity), "Should have Velocity after add")
+    vel := get(&world, entity, Velocity)
+    testing.expect(t, vel != nil && vel.x == 5 && vel.y == 6, "Velocity should have correct values")
+
+    pos := get(&world, entity, Position)
+    testing.expect(t, pos != nil && pos.x == 1 && pos.y == 2, "Position should be preserved")
+}
+
+@(test)
+test_remove_component :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    entity := spawn(&world, Position{1, 2}, Velocity{3, 4})
+
+    testing.expect(t, has(&world, entity, Velocity), "Should have Velocity initially")
+
+    remove_component(&world, entity, Velocity)
+
+    testing.expect(t, !has(&world, entity, Velocity), "Should not have Velocity after remove")
+    testing.expect(t, has(&world, entity, Position), "Should still have Position")
+
+    pos := get(&world, entity, Position)
+    testing.expect(t, pos != nil && pos.x == 1 && pos.y == 2, "Position should be preserved")
+}
+
+@(test)
+test_query_with_exclude :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    spawn(&world, Position{1, 1})
+    spawn(&world, Position{2, 2}, Velocity{1, 0})
+    spawn(&world, Position{3, 3}, Velocity{0, 1}, Health{100})
+
+    count_with_pos := query_count(&world, POSITION)
+    testing.expect(t, count_with_pos == 3, "3 entities have Position")
+
+    count_pos_without_vel := query_count(&world, POSITION, VELOCITY)
+    testing.expect(t, count_pos_without_vel == 1, "1 entity has Position without Velocity")
+
+    count_pos_without_health := query_count(&world, POSITION, HEALTH)
+    testing.expect(t, count_pos_without_health == 2, "2 entities have Position without Health")
+}
+
+@(test)
+test_spawn_with_mask :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    entities := spawn_with_mask(&world, POSITION | VELOCITY, 5)
+    defer delete(entities)
+
+    testing.expect(t, len(entities) == 5, "Should spawn 5 entities")
+    testing.expect(t, entity_count(&world) == 5, "World should have 5 entities")
+
+    for entity in entities {
+        testing.expect(t, has(&world, entity, Position), "Entity should have Position")
+        testing.expect(t, has(&world, entity, Velocity), "Entity should have Velocity")
+    }
+}
+
+@(test)
+test_query_first :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    entity, found := query_first(&world, POSITION)
+    testing.expect(t, !found, "Should not find any entity in empty world")
+
+    spawn(&world, Position{1, 1})
+    spawn(&world, Position{2, 2}, Velocity{1, 0})
+
+    entity, found = query_first(&world, POSITION)
+    testing.expect(t, found, "Should find entity with Position")
+
+    entity, found = query_first(&world, HEALTH)
+    testing.expect(t, !found, "Should not find entity with Health")
+
+    entity, found = query_first(&world, POSITION | VELOCITY)
+    testing.expect(t, found, "Should find entity with Position+Velocity")
+}
+
+@(test)
+test_has_components_mask :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    entity := spawn(&world, Position{1, 2}, Velocity{3, 4})
+
+    testing.expect(t, has_components(&world, entity, POSITION), "Should have Position")
+    testing.expect(t, has_components(&world, entity, VELOCITY), "Should have Velocity")
+    testing.expect(t, has_components(&world, entity, POSITION | VELOCITY), "Should have Position+Velocity")
+    testing.expect(t, !has_components(&world, entity, HEALTH), "Should not have Health")
+    testing.expect(t, !has_components(&world, entity, POSITION | HEALTH), "Should not have Position+Health")
+}
+
+@(test)
+test_component_mask :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    entity := spawn(&world, Position{1, 2}, Velocity{3, 4})
+
+    mask, ok := component_mask(&world, entity)
+    testing.expect(t, ok, "Should get component mask")
+    testing.expect(t, mask == POSITION | VELOCITY, "Mask should be Position|Velocity")
+}
+
+@(test)
+test_table_edges_cache :: proc(t: ^testing.T) {
+    world := setup_world()
+    defer destroy_world(&world)
+
+    e1 := spawn(&world, Position{1, 1})
+    add_component(&world, e1, Velocity{2, 2})
+
+    e2 := spawn(&world, Position{3, 3})
+    add_component(&world, e2, Velocity{4, 4})
+
+    testing.expect(t, has(&world, e1, Velocity), "e1 should have Velocity")
+    testing.expect(t, has(&world, e2, Velocity), "e2 should have Velocity")
+
+    pos1 := get(&world, e1, Position)
+    pos2 := get(&world, e2, Position)
+    testing.expect(t, pos1 != nil && pos1.x == 1, "e1 Position preserved")
+    testing.expect(t, pos2 != nil && pos2.x == 3, "e2 Position preserved")
+
+    vel1 := get(&world, e1, Velocity)
+    vel2 := get(&world, e2, Velocity)
+    testing.expect(t, vel1 != nil && vel1.x == 2, "e1 Velocity correct")
+    testing.expect(t, vel2 != nil && vel2.x == 4, "e2 Velocity correct")
+}
