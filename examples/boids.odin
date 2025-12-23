@@ -26,6 +26,7 @@ Boid_Params :: struct {
     cohesion_weight:         f32,
     separation_weight:       f32,
     visual_range:            f32,
+    visual_range_sq:         f32,
     min_speed:               f32,
     max_speed:               f32,
     paused:                  bool,
@@ -35,33 +36,37 @@ Boid_Params :: struct {
 }
 
 Boid_Data :: struct {
-    pos: Position,
-    vel: Velocity,
+    x, y:   f32,
+    vx, vy: f32,
 }
 
 Spatial_Grid :: struct {
-    cells:           [dynamic][dynamic]Boid_Data,
-    neighbor_buffer: [dynamic]Boid_Data,
-    cell_size:       f32,
-    width:           int,
-    height:          int,
+    cells:      [][]Boid_Data,
+    cell_counts: []int,
+    cell_size:  f32,
+    width:      int,
+    height:     int,
+    inv_cell:   f32,
 }
 
-create_grid :: proc(screen_width, screen_height, cell_size: f32) -> Spatial_Grid {
+create_grid :: proc(screen_width, screen_height, cell_size: f32, max_per_cell: int) -> Spatial_Grid {
     width := int(math.ceil(screen_width / cell_size))
     height := int(math.ceil(screen_height / cell_size))
+    total := width * height
 
-    cells := make([dynamic][dynamic]Boid_Data, width * height)
-    for &cell in cells {
-        cell = make([dynamic]Boid_Data)
+    cells := make([][]Boid_Data, total)
+    cell_counts := make([]int, total)
+    for i in 0..<total {
+        cells[i] = make([]Boid_Data, max_per_cell)
     }
 
     return Spatial_Grid{
-        cells           = cells,
-        neighbor_buffer = make([dynamic]Boid_Data),
-        cell_size       = cell_size,
-        width           = width,
-        height          = height,
+        cells       = cells,
+        cell_counts = cell_counts,
+        cell_size   = cell_size,
+        width       = width,
+        height      = height,
+        inv_cell    = 1.0 / cell_size,
     }
 }
 
@@ -70,55 +75,63 @@ destroy_grid :: proc(grid: ^Spatial_Grid) {
         delete(cell)
     }
     delete(grid.cells)
-    delete(grid.neighbor_buffer)
+    delete(grid.cell_counts)
 }
 
-grid_clear :: proc(grid: ^Spatial_Grid) {
-    for &cell in grid.cells {
-        clear(&cell)
+grid_clear :: #force_inline proc(grid: ^Spatial_Grid) {
+    for i in 0..<len(grid.cell_counts) {
+        grid.cell_counts[i] = 0
     }
 }
 
-grid_insert :: proc(grid: ^Spatial_Grid, pos: Position, vel: Velocity) {
-    index := grid_cell_index(grid, pos.x, pos.y)
-    if index >= 0 && index < len(grid.cells) {
-        append(&grid.cells[index], Boid_Data{pos, vel})
+grid_insert :: #force_inline proc(grid: ^Spatial_Grid, x, y, vx, vy: f32) #no_bounds_check {
+    cell_x := clamp(int(x * grid.inv_cell), 0, grid.width - 1)
+    cell_y := clamp(int(y * grid.inv_cell), 0, grid.height - 1)
+    idx := cell_x + cell_y * grid.width
+    count := grid.cell_counts[idx]
+    if count < len(grid.cells[idx]) {
+        grid.cells[idx][count] = Boid_Data{x, y, vx, vy}
+        grid.cell_counts[idx] = count + 1
     }
 }
 
-grid_cell_index :: proc(grid: ^Spatial_Grid, x, y: f32) -> int {
-    cell_x := clamp(int(math.floor(x / grid.cell_size)), 0, grid.width - 1)
-    cell_y := clamp(int(math.floor(y / grid.cell_size)), 0, grid.height - 1)
-    return cell_x + cell_y * grid.width
-}
-
-grid_get_nearby :: proc(grid: ^Spatial_Grid, pos: Position, range: f32) -> []Boid_Data {
-    clear(&grid.neighbor_buffer)
-
-    range_cells := int(math.ceil(range / grid.cell_size))
-    cell_x := int(math.floor(pos.x / grid.cell_size))
-    cell_y := int(math.floor(pos.y / grid.cell_size))
-
-    for dy in -range_cells..=range_cells {
-        for dx in -range_cells..=range_cells {
-            x := cell_x + dx
-            y := cell_y + dy
-
-            if x >= 0 && x < grid.width && y >= 0 && y < grid.height {
-                index := x + y * grid.width
-                for boid in grid.cells[index] {
-                    append(&grid.neighbor_buffer, boid)
-                }
-            }
-        }
-    }
-
-    return grid.neighbor_buffer[:]
+fast_inv_sqrt :: #force_inline proc(x: f32) -> f32 {
+    xhalf := 0.5 * x
+    i := transmute(i32)x
+    i = 0x5f3759df - (i >> 1)
+    y := transmute(f32)i
+    y = y * (1.5 - xhalf * y * y)
+    return y
 }
 
 Boid_Cache :: struct {
-    velocity_updates:   [dynamic]Velocity,
-    positions_snapshot: [dynamic]Position,
+    positions:  []Position,
+    velocities: []Velocity,
+    capacity:   int,
+}
+
+create_cache :: proc(capacity: int) -> Boid_Cache {
+    return Boid_Cache{
+        positions  = make([]Position, capacity),
+        velocities = make([]Velocity, capacity),
+        capacity   = capacity,
+    }
+}
+
+destroy_cache :: proc(cache: ^Boid_Cache) {
+    delete(cache.positions)
+    delete(cache.velocities)
+}
+
+ensure_cache_capacity :: proc(cache: ^Boid_Cache, needed: int) {
+    if needed > cache.capacity {
+        new_cap := needed * 2
+        delete(cache.positions)
+        delete(cache.velocities)
+        cache.positions = make([]Position, new_cap)
+        cache.velocities = make([]Velocity, new_cap)
+        cache.capacity = new_cap
+    }
 }
 
 POSITION: u64
@@ -144,22 +157,33 @@ process_boids :: proc(world: ^ecs.World, grid: ^Spatial_Grid, cache: ^Boid_Cache
     MAX_NEIGHBORS :: 7
     boid_mask := POSITION | VELOCITY | BOID
 
+    entity_total := ecs.entity_count(world)
+    ensure_cache_capacity(cache, entity_total)
+
     grid_clear(grid)
-    clear(&cache.positions_snapshot)
 
     matching := ecs.get_matching_archetypes(world, boid_mask)
+    boid_count := 0
+
     for arch_idx in matching {
         arch := &world.archetypes[arch_idx]
         positions := ecs.column_unchecked(arch, Position, POSITION)
         velocities := ecs.column_unchecked(arch, Velocity, VELOCITY)
         count := len(arch.entities)
+
         #no_bounds_check for i in 0..<count {
-            append(&cache.positions_snapshot, positions[i])
-            grid_insert(grid, positions[i], velocities[i])
+            p := positions[i]
+            v := velocities[i]
+            cache.positions[boid_count] = p
+            cache.velocities[boid_count] = v
+            grid_insert(grid, p.x, p.y, v.x, v.y)
+            boid_count += 1
         }
     }
 
-    clear(&cache.velocity_updates)
+    visual_range_sq := params.visual_range_sq
+    range_cells := int(math.ceil(params.visual_range * grid.inv_cell))
+    mouse_range_sq := params.mouse_influence_range * params.mouse_influence_range
 
     boid_idx := 0
     for arch_idx in matching {
@@ -168,40 +192,59 @@ process_boids :: proc(world: ^ecs.World, grid: ^Spatial_Grid, cache: ^Boid_Cache
         count := len(arch.entities)
 
         #no_bounds_check for i in 0..<count {
-            pos := cache.positions_snapshot[boid_idx]
-            vel := velocities[i]
+            pos := cache.positions[boid_idx]
+            vel := cache.velocities[boid_idx]
 
-            alignment := Velocity{}
-            cohesion := Position{}
-            separation := Velocity{}
+            align_x, align_y: f32 = 0, 0
+            cohesion_x, cohesion_y: f32 = 0, 0
+            sep_x, sep_y: f32 = 0, 0
             neighbors := 0
 
-            nearby := grid_get_nearby(grid, pos, params.visual_range)
-            for boid_data in nearby {
-                dx := boid_data.pos.x - pos.x
-                dy := boid_data.pos.y - pos.y
-                dist_sq := dx * dx + dy * dy
+            cell_x := int(pos.x * grid.inv_cell)
+            cell_y := int(pos.y * grid.inv_cell)
 
-                if dist_sq > 0 && dist_sq < params.visual_range * params.visual_range {
-                    alignment.x += boid_data.vel.x
-                    alignment.y += boid_data.vel.y
-                    cohesion.x += boid_data.pos.x
-                    cohesion.y += boid_data.pos.y
-                    factor := 1.0 / math.sqrt(dist_sq)
-                    separation.x -= dx * factor
-                    separation.y -= dy * factor
-                    neighbors += 1
+            for dy in -range_cells..=range_cells {
+                cy := cell_y + dy
+                if cy < 0 || cy >= grid.height { continue }
+
+                for dx in -range_cells..=range_cells {
+                    cx := cell_x + dx
+                    if cx < 0 || cx >= grid.width { continue }
+
+                    cell_idx := cx + cy * grid.width
+                    cell_count := grid.cell_counts[cell_idx]
+                    cell := grid.cells[cell_idx]
+
+                    for j in 0..<cell_count {
+                        boid := cell[j]
+                        bx := boid.x - pos.x
+                        by := boid.y - pos.y
+                        dist_sq := bx * bx + by * by
+
+                        if dist_sq > 0 && dist_sq < visual_range_sq {
+                            align_x += boid.vx
+                            align_y += boid.vy
+                            cohesion_x += boid.x
+                            cohesion_y += boid.y
+                            inv_dist := fast_inv_sqrt(dist_sq)
+                            sep_x -= bx * inv_dist
+                            sep_y -= by * inv_dist
+                            neighbors += 1
+                            if neighbors >= MAX_NEIGHBORS { break }
+                        }
+                    }
                     if neighbors >= MAX_NEIGHBORS { break }
                 }
+                if neighbors >= MAX_NEIGHBORS { break }
             }
 
             mouse_dx := mouse_pos[0] - pos.x
             mouse_dy := mouse_pos[1] - pos.y
             mouse_dist_sq := mouse_dx * mouse_dx + mouse_dy * mouse_dy
-            mouse_range_sq := params.mouse_influence_range * params.mouse_influence_range
 
             if mouse_dist_sq < mouse_range_sq {
-                mouse_influence := 1.0 - math.sqrt(mouse_dist_sq / mouse_range_sq)
+                mouse_inv := fast_inv_sqrt(mouse_range_sq)
+                mouse_influence := 1.0 - math.sqrt(mouse_dist_sq) * mouse_inv
                 if mouse_attract {
                     vel.x += mouse_dx * mouse_influence * params.mouse_attraction_weight
                     vel.y += mouse_dy * mouse_influence * params.mouse_attraction_weight
@@ -214,38 +257,30 @@ process_boids :: proc(world: ^ecs.World, grid: ^Spatial_Grid, cache: ^Boid_Cache
 
             if neighbors > 0 {
                 inv := 1.0 / f32(neighbors)
-                alignment.x *= inv * params.alignment_weight
-                alignment.y *= inv * params.alignment_weight
-                cohesion.x = (cohesion.x * inv - pos.x) * params.cohesion_weight
-                cohesion.y = (cohesion.y * inv - pos.y) * params.cohesion_weight
-                vel.x += alignment.x + cohesion.x + separation.x * params.separation_weight
-                vel.y += alignment.y + cohesion.y + separation.y * params.separation_weight
+                vel.x += (align_x * inv) * params.alignment_weight
+                vel.y += (align_y * inv) * params.alignment_weight
+                vel.x += (cohesion_x * inv - pos.x) * params.cohesion_weight
+                vel.y += (cohesion_y * inv - pos.y) * params.cohesion_weight
+                vel.x += sep_x * params.separation_weight
+                vel.y += sep_y * params.separation_weight
             }
 
-            speed := math.sqrt(vel.x * vel.x + vel.y * vel.y)
-            if speed > params.max_speed {
-                f := params.max_speed / speed
+            speed_sq := vel.x * vel.x + vel.y * vel.y
+            max_sq := params.max_speed * params.max_speed
+            min_sq := params.min_speed * params.min_speed
+
+            if speed_sq > max_sq {
+                f := params.max_speed * fast_inv_sqrt(speed_sq)
                 vel.x *= f
                 vel.y *= f
-            } else if speed < params.min_speed && speed > 0 {
-                f := params.min_speed / speed
+            } else if speed_sq < min_sq && speed_sq > 0 {
+                f := params.min_speed * fast_inv_sqrt(speed_sq)
                 vel.x *= f
                 vel.y *= f
             }
 
-            append(&cache.velocity_updates, vel)
+            velocities[i] = vel
             boid_idx += 1
-        }
-    }
-
-    update_idx := 0
-    for arch_idx in matching {
-        arch := &world.archetypes[arch_idx]
-        velocities := ecs.column_unchecked(arch, Velocity, VELOCITY)
-        count := len(arch.entities)
-        #no_bounds_check for i in 0..<count {
-            velocities[i] = cache.velocity_updates[update_idx]
-            update_idx += 1
         }
     }
 }
@@ -272,10 +307,11 @@ wrap_positions :: proc(world: ^ecs.World, screen_w, screen_h: f32) {
         positions := ecs.column_unchecked(arch, Position, POSITION)
         count := len(arch.entities)
         #no_bounds_check for i in 0..<count {
-            if positions[i].x < 0 { positions[i].x += screen_w }
-            if positions[i].x > screen_w { positions[i].x -= screen_w }
-            if positions[i].y < 0 { positions[i].y += screen_h }
-            if positions[i].y > screen_h { positions[i].y -= screen_h }
+            p := &positions[i]
+            if p.x < 0 { p.x += screen_w }
+            else if p.x > screen_w { p.x -= screen_w }
+            if p.y < 0 { p.y += screen_h }
+            else if p.y > screen_h { p.y -= screen_h }
         }
     }
 }
@@ -283,6 +319,7 @@ wrap_positions :: proc(world: ^ecs.World, screen_w, screen_h: f32) {
 render_boids :: proc(world: ^ecs.World) {
     render_mask := POSITION | VELOCITY | COLOR
     matching := ecs.get_matching_archetypes(world, render_mask)
+
     for arch_idx in matching {
         arch := &world.archetypes[arch_idx]
         positions := ecs.column_unchecked(arch, Position, POSITION)
@@ -295,10 +332,20 @@ render_boids :: proc(world: ^ecs.World) {
             vel := velocities[i]
             col := colors[i]
 
-            angle := math.atan2(vel.y, vel.x)
-            p1 := rl.Vector2{pos.x, pos.y}
-            p2 := rl.Vector2{pos.x - 8 * math.cos(angle + 2), pos.y - 8 * math.sin(angle + 2)}
-            p3 := rl.Vector2{pos.x - 8 * math.cos(angle - 2), pos.y - 8 * math.sin(angle - 2)}
+            speed_sq := vel.x * vel.x + vel.y * vel.y
+            if speed_sq < 0.01 { continue }
+
+            inv_speed := fast_inv_sqrt(speed_sq)
+            dx := vel.x * inv_speed
+            dy := vel.y * inv_speed
+
+            px := -dy * 4
+            py := dx * 4
+
+            p1 := rl.Vector2{pos.x + dx * 6, pos.y + dy * 6}
+            p2 := rl.Vector2{pos.x - dx * 4 + px, pos.y - dy * 4 + py}
+            p3 := rl.Vector2{pos.x - dx * 4 - px, pos.y - dy * 4 - py}
+
             color := rl.Color{u8(col.r * 255), u8(col.g * 255), u8(col.b * 255), 255}
             rl.DrawTriangle(p1, p3, p2, color)
         }
@@ -321,11 +368,13 @@ main :: proc() {
     BOID     = ecs.register(&world, Boid)
     COLOR    = ecs.register(&world, Boid_Color)
 
+    visual_range: f32 = 50.0
     params := Boid_Params{
         alignment_weight        = 0.5,
         cohesion_weight         = 0.3,
         separation_weight       = 0.4,
-        visual_range            = 50.0,
+        visual_range            = visual_range,
+        visual_range_sq         = visual_range * visual_range,
         min_speed               = 100.0,
         max_speed               = 300.0,
         mouse_attraction_weight = 0.96,
@@ -333,15 +382,11 @@ main :: proc() {
         mouse_influence_range   = 150.0,
     }
 
-    grid := create_grid(f32(screen_w), f32(screen_h), params.visual_range / 2)
+    grid := create_grid(f32(screen_w), f32(screen_h), visual_range / 2, 64)
     defer destroy_grid(&grid)
 
-    cache := Boid_Cache{
-        velocity_updates   = make([dynamic]Velocity),
-        positions_snapshot = make([dynamic]Position),
-    }
-    defer delete(cache.velocity_updates)
-    defer delete(cache.positions_snapshot)
+    cache := create_cache(2000)
+    defer destroy_cache(&cache)
 
     spawn_boids(&world, 1000, f32(screen_w), f32(screen_h))
 
