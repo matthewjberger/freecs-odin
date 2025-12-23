@@ -238,4 +238,4 @@ All 13 tests verify:
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE.md) file for details.
